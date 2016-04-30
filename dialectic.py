@@ -17,6 +17,12 @@ turn_mark = datetime.datetime.utcnow() # placeholder, global
 speaker = "" # placeholder, global
 
 
+# bot needs: 
+# some way to get op/admin (can just register nick on server if need be)
+# ability to display queue to user
+# points system (set categories? custom ones? both?)
+
+
 @hook.command 
 def dialectic(inp, conn=None, say=None, nick="", chan=""):
 
