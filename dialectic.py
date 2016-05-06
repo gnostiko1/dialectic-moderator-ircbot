@@ -1,221 +1,302 @@
-from util import hook, timesince
+from util import hook
 import collections
 import datetime
+import operator
 import time
 import re
 
+# Introduction:
+# trolls are unwelcome
+# play nice. first warning is a kick, second is kickban
+# queue is automatically sorted by number of turns taken, from smallest to largest. if you haven't spoken as much as some other guys, you will be prioritized
+# during a given turn, you are able to vote for the previous speaker
+# one send per turn
 
-# variables to tweak bot
-interval = 1 # how often the heartbeat checks statuses
+class Participant:
 
+	score = {"+":1, ".":0, "-":-1}
+	categories = ("accurate, insightful, logical")
 
-#initializing global variables
-dsc = False # state variable for dialectic (True = active, False = inactive)
-trn = False # state variable for turns (True = someone has the floor, False = no one has the floor)
-queue_list = [] # current queue_list of people waiting to speak
-queued_list = [] # blacklist: people who have already spoken. it empties when the queue_list is empty. prevents domination of dialectic
-turn_length = 60 # length of time someone has the floor
-turn_mark = datetime.datetime.utcnow() # placeholder, global
-speaker = "" # placeholder, global
-awards = collections.defaultdict(collections.Counter)
-num_turns = collections.Counter()
+	def __init__(self, nick):
+		self.nick = nick
+		self.num_turns = 0
+		self.queue = False
+		self.time_queued = datetime.datetime.utcnow()
+		self.awards = collections.Counter()
 
-# bot needs: 
-# some way to get op/admin (can just register nick on server if need be)
-# points system (set categories? custom ones? both?)
+	def add_to_queue(self):
+		self.queue = True
+		self.time_queued = datetime.datetime.utcnow()
 
+	def remove_from_queue(self):
+		self.queue = False
 
+	def award_points(self, **ptargs):
+		a = score[ptargs["a"]]
+		i = score[ptargs["i"]]
+		l = score[ptargs["l"]]
+		self.awards["a"] += a
+		self.awards["i"] += i
+		self.awards["l"] += l
+		db.execute("update dialectic_log set accuracy=?, insight=?, logic=? where nick=? order by timestamp desc limit 1)", (a, i, l, self.nick)) # for the log
+		db.execute("update points set accuracy=accuracy+?, insight=insight+?, logic=logic+? where nick=?", (a, i, l, self.nick)) # for persistent points system
+		db.commit()
 
-@hook.command 
-def dialectic(inp, conn=None, say=None, nick="", chan="", reply=None):
+	def voice(self, conn, chan):
+		conn.cmd('MODE ' + chan + ' +v '+self.nick)
+		self.num_turns += 1
 
-    """
-    Begins a dialectic session.
-    Syntax: !dialectic [turn length in seconds] [topic]
-    """
-
-    global dsc
-    global trn
-    global queue_list
-    global queued_list
-    global turn_length
-
-    if nick=="rawkies" or nick=="gnostikoi": # handlers of Zeno
-
-        if dsc: # can't start a dialectic if it's already going
-            reply("A dialectic is already in session.")
-
-        else: # if dialectic is not currently happening...
-            parse = inp.split()
-            try:
-                turn_length = int(parse[0])
-                topic = " ".join(parse[1:])
-                dsc = True # DIALECTIC: ENGAGE
-                trn = False
-                conn.cmd('TOPIC', [chan, topic]) # add topic from command
-                conn.cmd('MODE '+chan+' +m') # change channel mode to 'moderated'
-                say("Welcome to the dialectic... queue is now open. When queueing, be sure to send me a private message, as you are muted in the channel.")
-            except ValueError:
-                reply("To start a session please use the syntax: !dialectic [turn length in seconds] [topic]")
+	def unvoice(self, conn, chan):
+		conn.cmd('MODE ' + chan + ' -v '+self.nick)
 
 
-    else:
-        reply("You must be my handler to begin a dialectic.") # deny access for plebs
+#state variables for flow control
+dsc = False
+trn = False
+vote_start = False
+vote_agree = False
+vote_end = False
+
+#packaged for cleaner hooks
+state = {"dialectic":dsc, "turn":trn, "vote":{"start":vote_start, "agree":vote_agree, "end":vote_end}}
+
+#packaged for cleaner hooks
+participants = [[], {}, []]
+
+#results of votes
+start_votes = collections.Counter()
+agree_votes = collections.Counter()
+end_votes = collections.Counter()
+
+#packaged for cleaner hooks
+votes = {"start":start_votes, "agree":agree_votes, "end":end_votes}
+
+#store everything else in one dict for easy movement
+other_vars = {}
+
+
+@hook.regex(".")
+def logger(match, db=None, paraml=None, bot=None, chan="", nick=""):
+	global state
+	global other_vars
+	if state["dialectic"] and paraml[0]=="#dialectics":
+		db.execute("insert into dialectic_log(nick, message, timestamp)"
+			"values(?,?,?)", (nick, paraml[1], datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+		db.commit()
+		if nick!=bot.config.get("nick"):
+			other_vars["turn_end"] = True
+
+
+def save_log_to_text(db, topic):
+	with open("Dialectic{}.txt".format(datetime.datetime.utcnow().strftime("%Y%m%d%H%M")), "w") as f:
+		f.write("Topic of the discussion: "+topic)
+		f.write("Note: all timestamps in UTC")
+		for line in db.execute("select * from dialectic_log order by timestamp").fetchall():
+			f.write("{} | <{}> \"{}\" (a {:+d}; i {:+d}; l {:+d})".format(line[2], line[0], line[1], line[3], line[4], line[5]))
 
 
 @hook.command
-def end(inp, conn=None, say=None, nick="", chan=""):
+def dialectic(inp, db=None, conn=None, pm=None, reply=None, chan=""):
+	'''Begins a dialectic. Usage: !dialectic [turn length in seconds] [topic]'''
+	global state
+	global votes
+	global participants
+	global other_vars
 
-    """
-    Ends a dialectic session.
-    Syntax: !end
-    Note: will only work in PM unless user can override voice (e.g. as op)
-    """
+	if not state["dialectic"]:
+		state["dialectic"] = True
+		db.execute("create table if not exists dialectic_log(nick, message, timestamp, accuracy, insight, logic)")  # log for the session
+		db.execute("create table if not exists points(nick, accuracy, insight, logic)")  # persistent tally
+		db.execute("delete from dialectic_log")
+		db.commit()
+		parse = inp.split()
 
-    global dsc
-    global trn
-    global speaker
+		try:
+			other_vars["turn_length"] = int(parse[0])
+			other_vars["topic"] = " ".join(parse[1:])
+			conn.cmd('MODE ' + chan + " +m")
 
-    if nick=="rawkies" or nick=="gnostikoi": # handlers of Zeno
-        dsc = False # reset everything to baseline
-        trn = False
-        queue_list = []
-        queued_list = []
-        conn.cmd('MODE '+chan+' -v '+speaker)
-        conn.cmd('MODE '+chan+' -m')
-        say("Thanks to everyone for participating in this dialectic session!")
-        
-    else:
-        reply("You must be my handler to end a dialectic.") # no plebs are allowed to ragequit the dialectic session
+			state["vote"]["start"] = True
+			votes["start"] = collections.Counter()
+			conn.msg("#dialectics", "Should we apply the dialectic to the opinion '{}'? Vote 'yes' or 'no' in a private message to me. You may only participate in the dialectic if you answer this question.".format(other_vars["topic"]))
+			time.sleep(60)
+			state["vote"]["start"] = False
+
+			if votes["start"]["yes"]/len(participants[0])>0.5:
+
+				for n in participants[0]:
+					pm("Before the dialectic begins, do you agree with the opinion, '{}'? Vote 'yes' or 'no' in a private message to me. To participate in the dialectic you must also answer this question.".format(other_vars["topic"]), nick=n)
+				state["vote"]["agree"] = True
+				other_vars["vote_mark"] = datetime.datetime.utcnow()
+				while (datetime.datetime.utcnow()-other_vars["vote_mark"]).seconds<60 \
+					and votes["agree"]["yes"]+votes["agree"]["no"]<len(participants[0]):
+					time.sleep(1)
+				state["vote"]["agree"] = False
+
+				for n in participants[1]:
+					pm("Welcome. This is how you queue...", nick=n)
+				other_vars["turn_mark"] = datetime.datetime.utcnow()
+				other_vars["turn_end"] = False
+
+			else:
+				conn.msg("#dialectics", "Unfortunately the vote did not meet the requirement.")
+				conn.cmd('MODE' + chan + " -m")
+		except ValueError:
+			state["dialectic"] = False
+			reply("Please fix the syntax: !dialectic [turn length in seconds] [opinion]")
+
+	else:
+		reply("Please wait until the current dialectic is finished.")
 
 
 @hook.command
-def queue(inp, notice=None, reply=None, nick=""):
+def cloture(inp, db=None, conn=None, pm=None):
+	global state
+	global votes
+	global participants
+	global other_vars
 
-    """
-    Enters the sender into the speaking queue.
-    Syntax: !queue
-    Note: will only work in PM
-    """
+	if state["dialectic"]:
+		state["dialectic"] = False
+		state["turn"] = False
 
-    global dsc
-    global queue_list
-    global queued_list
-    global num_turns
+		for n in participants[1]:
+			pm("A call for cloture has come. After this dialectic, do you think the opinion, '{}' is true or false?".format(other_vars["topic"]), nick=n)
+		
+		state["vote"]["end"] = True
+		other_vars["vote_mark"] = datetime.datetime.utcnow()
+		while (datetime.datetime.utcnow()-other_vars["vote_mark"]).seconds<60 \
+			and votes["end"]["yes"]+votes["end"]["no"]<len(participants[1]):
+			time.sleep(1)
+		state["vote"]["end"] = False
+		
+		conn.msg("#dialectics", "Thank you all for participating. Before this dialectic it was the opinion of {}/{} of #dialectics that the opinion '{}' is true. After this dialectic it is the opinion of {}/{} of #dialectics that this opinion is true.".format(vote["agree"]["yes"], len(participants[1]), other_vars["topic"], vote["end"]["yes"], len(participants[2])))
+		save_log_to_text(db, other_vars["topic"])
 
-    if dsc:
 
-        if nick in queued_list: # if you've already been blacklisted...
-            reply("The queue has not yet emptied. You have not been re-added to the queue.") # nothing happens and you have to wait until the queue_list is empty
+@hook.command
+def queue(inp, reply=None, nick=""):
+	global state
+	global participants
 
-        else:
-            queue_list.append(nick) # add to queue_list
-            queued_list.append(nick) # add to blacklist for when person is eventually removed from queue_list
-            num_turns[nick] += 1  # add one to the turn counter for queued_list person
-            turns_per_person = [num_turns[nick] for nick in queue_list]  # get turn count for each person in queue_list
-            queue_list = [x for y,x in sorted(turns_per_person, queue_list)]  # sort 'queue_list' by turn count
-            reply("You have been added to the queue.")
+	if state["dialectic"]:
+		if not participants[1][nick].queue:
+			participants[1][nick].add_to_queue()
+		else:
+			reply("You are already in the queue!")
 
-    else:
 
-        reply("A dialectic is not in session.")
+@hook.command
+def unqueue(inp, reply=None, nick=""):
+	global state
+	global participants
+
+	if state["dialectic"]:
+		if participants[1][nick].queue:
+			participants[1][nick].remove_from_queue()
+		else:
+			reply("You are not in the queue!")
+
+
+def get_queue(participants):
+	return sorted(((p.nick) for p in participants[1] if p.queue), key=operator.attrgetter("num_turns", "time_queued"))
+
 
 @hook.command
 def whosup(inp, reply=None):
+	global state
+	global participants
+	if state["dialectic"]:
+		q = sorted(((p.nick) for p in participants[1] if p.queue), key=operator.attrgetter("num_turns", "time_queued"))
+		if len(q)!=0:
+			reply("Up next: " + ", ".join((("{}) {}".format(i+1, q[i].nick) for i in range(len(q))))))
+		else:
+			reply("The queue is empty. Feel free to enter by messaging me with '!queue'")
 
-    """
-    Replies with the queue.
-    Syntax: !whosup
-    """
 
-    global queue_list
+@hook.regex("^(yes|no)$", flags=re.IGNORECASE)
+def voting(match, nick="", reply=None):
+	global state
+	global votes
+	global participants
 
-    if dsc:
+	if state["dialectic"]:
 
-        if len(queue_list)==0:
-            reply("The queue is empty! If you'd like, add yourself with !queue")
+		if state["vote"]["start"] and nick not in participants[0]:
+			participants[0].append(nick)
+			votes["start"][match.group(1)] += 1
+			reply("Thank you. Your vote has been recorded.")
 
-        else:
-            out_intro = "Coming up on #dialectics! "
-            out_list = []
-            for i in range(len(queue_list)):
-                out_list.append("{}) {}".format(i+1, queue_list[i]))  # give members of queue_list and number them
-            print(out_intro + ", ".join(out_list))  # print full string, separated by commas
+		elif state["vote"]["agree"] and nick in participants[0] and nick not in participants[1].keys():
+			participants[1][nick] = Participant(nick)
+			votes["agree"][match.group(1)] += 1
+			reply("Thank you. Your vote has been recorded.")
 
-    else:
-
-        reply("A dialectic is not in session.")
+		elif state["vote"]["end"] and nick in participants[1].keys() and nick not in participants[2]:
+			participants[2].append(nick)
+			votes["end"][match.group(1)] += 1
+			reply("Thank you. Your vote has been recorded.")
 
 
 @hook.command
 def award(inp):
-    """
-    Awards points to user for given reason.
-    Syntax: !award [user] [point category]
-    """
-
-    global speaker
-    global awards
-
-    recv = inp.split()
-    awardee = recv[0]
-    points = "".join(recv[1:])
-    if len(recv)>2 or len(points)!=6:
-        reply("Please fix your formatting. Syntax is !award [user] [a(+|.|-)i(+|.|-)l(+|.|-)]. '+' indicates one point is awarded to the user, '.' is no points, and '-' indicates one point is deducted.")
-    else:
-        categories = ["Accuracy", "Insight", "Logic"]
-        scores = {"+": 1, ".": 0, "-": -1}
-        if nick==awardee:
-            reply("You're not allowed to award points to yourself.")
-        else:
-            for c in categories:
-                awards[c][nick] += scores[re.search("(?<={})(\+|\.|\-)".format(c[0].lower()), points).group(0)]  # gets the score for each category
+	global other_vars
+	pts = {}
+	for c in ("a","i","l"):
+		m = re.search("(?<={})(+|-)".format(c), "".join(inp.split())).group(1)
+		if m!="":
+			pts[c] = m
+	participants[1][other_vars["last_speaker"]].award_points(pts)
 
 
-@hook.singlethread # keeps running in the same thread so as not to spawn a bunch of while loops running simultaneously
-@hook.regex(".") # triggers on every line sent from the channel
-def heartbeat(inp, conn=None, say=None, chan="", raw=None):
+@hook.command
+def leaderboard(inp, db=None, reply=None):
+	a = db.execute("select nick from points where accuracy=max(accuracy)").fetchall()
+	apts = db.execute("select accuracy from points where nick=?", (a[0],)).fetchone()
+	i = db.execute("select nick from points where insight=max(insight)").fetchall()
+	ipts = db.execute("select insight from points where nick=?", (i[0],)).fetchone()
+	l = db.execute("select nick from points where logic=max(logic)").fetchall()
+	lpts = db.execute("select logic from points where nick=?", (l[0],)).fetchone()
+	out = ""
+	if len(a)==1:
+		out += "The all-time leader in accuracy is {} with {} points. ".format(a[0], apts)
+	else:
+		out += "The all-time leaders in accuracy are " + ", ".join(a[:-1]) + "and {} with {} points. ".format(a[-1], apts)
+	if len(i)==1:
+		out += "The all-time leader in insight is {} with {} points. ".format(i[0], ipts)
+	else:
+		out += "The all-time leaders in insight are " + ", ".join(i[:-1]) + "and {} with {} points. ".format(i[-1], ipts)
+	if len(l)==1:
+		out += "The all-time leader in logic is {} with {} points. ".format(l[0], lpts)
+	else:
+		out += "The all-time leaders in logic are " + ", ".join(l[:-1]) + "and {} with {} points. ".format(l[-1], lpts)
+	reply(out)
 
-    """
-    Controls the flow of a dialectic session.
-    """
 
-    global dsc
-    global trn
-    global queue_list
-    global queued_list
-    global speaker
-    global turn_length
-    global turn_mark
-
-    print(raw)
-
-    while dsc: # only loop if a dialectic session is in progress
-
-        if trn: # if someone has the floor...
-
-            if (datetime.datetime.utcnow()-turn_mark).seconds>turn_length: # if someone's turn is over...
-
-                try:
-                    conn.cmd('MODE '+chan+' -v '+speaker) # take them off the floor
-                    say(speaker+"'s turn has expired.")
-                    speaker = queue_list.pop(0) # pull the next person from queue_list. if queue_list is empty, throws IndexError
-                    say(speaker+" has the floor.") # mention what happened
-                    conn.cmd('MODE '+chan+' +v '+speaker) # give the next person the floor
-                    turn_mark = datetime.datetime.utcnow() # mark the beginning of their turn
-
-                except IndexError: # if queue_list is empty, this exception triggers when we try to get the next speaker
-                    queued_list = [] # empty the blacklist
-                    trn = False # set state so loop starts checking when queue_list is populated again
-                    say("The queue is now empty. You are free to enter the queue again.")
-
-        else: # if no one has the floor...
-
-            if len(queue_list)!=0: # if someone entered the queue_list in the last interval...
-                trn = True # someone has the floor now
-                speaker = queue_list.pop(0) # get the name of the first person in the queue_list
-                conn.cmd('MODE '+chan+' +v '+speaker) # give them voice
-                say(speaker+" now has the floor.")
-                turn_mark = datetime.datetime.utcnow() # mark beginning of turn
-
-        time.sleep(interval) # only loop every *interval* seconds
+@hook.singlethread
+@hook.regex(".")
+def heartbeat(match, conn=None, chan=""):
+	global state
+	global participants
+	global other_vars
+	while state["dialectic"]:
+		if state["turn"]:
+			if (datetime.datetime.utcnow()-other_vars["turn_mark"]).seconds>other_vars["turn_length"] or other_vars["turn_end"]:
+				other_vars["last_speaker"] = other_vars["speaker"]
+				participants[1][other_vars["last_speaker"]].remove_from_queue()
+				participants[1][other_vars["last_speaker"]].unvoice(conn, chan)
+				other_vars["turn_end"] = False
+				try:
+					other_vars["speaker"] = get_queue(participants[1])[0]
+					participants[1][other_vars["speaker"]].voice(conn, chan)
+					other_vars["turn_mark"] = datetime.datetime.utcnow()
+				except IndexError:
+					conn.msg("#dialectics", "The queue is now empty. Feel free to enter with !queue")
+					state["turn"] = False
+		else:
+			if len([p for p in participants[1].values() if p.queue])!=0:
+				state["turn"] = True
+				other_vars["speaker"] = get_queue(participants[1])[0]
+				other_vars["turn_mark"] = datetime.datetime.utcnow()
+				conn.msg(other_vars["speaker"], "You now have the floor.")
+		time.sleep(1)
